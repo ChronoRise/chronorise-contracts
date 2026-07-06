@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, token, Address, Env, Map, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Map, Vec,
 };
 
 // ─── Storage Keys ────────────────────────────────────────────────────────────
@@ -10,7 +10,13 @@ pub enum DataKey {
     Admin,
     RewardToken,
     TotalDeposited,
+    /// Map<Address, i128>: depositor balances
     Balances,
+    /// Map<u32, i128>: amount reserved per achievement_id
+    AchievementPool(u32),
+    /// Map<Address, bool>: per-player per-achievement claim flag
+    /// Encoded as a composite: AchievementClaim(player, achievement_id)
+    AchievementClaim(Address, u32),
 }
 
 // ─── Contract ────────────────────────────────────────────────────────────────
@@ -55,11 +61,9 @@ impl RewardPoolContract {
             .get(&DataKey::RewardToken)
             .expect("not initialized");
 
-        // Transfer tokens from sender into this contract.
         let token = token::Client::new(&env, &token_id);
         token.transfer(&from, &env.current_contract_address(), &amount);
 
-        // Update balances.
         let mut balances: Map<Address, i128> = env
             .storage()
             .instance()
@@ -71,7 +75,6 @@ impl RewardPoolContract {
             .instance()
             .set(&DataKey::Balances, &balances);
 
-        // Update total.
         let total: i128 = env
             .storage()
             .instance()
@@ -84,7 +87,7 @@ impl RewardPoolContract {
 
     // ── Distribute ───────────────────────────────────────────────────────────
 
-    /// Admin-only: distribute `amount` tokens to `recipient`.
+    /// Admin-only: distribute `amount` tokens to `recipient` (generic).
     pub fn distribute(env: Env, recipient: Address, amount: i128) {
         let admin: Address = env
             .storage()
@@ -103,7 +106,6 @@ impl RewardPoolContract {
         let token = token::Client::new(&env, &token_id);
         token.transfer(&env.current_contract_address(), &recipient, &amount);
 
-        // Reduce total deposited.
         let total: i128 = env
             .storage()
             .instance()
@@ -152,6 +154,99 @@ impl RewardPoolContract {
 
         let token = token::Client::new(&env, &token_id);
         token.transfer(&env.current_contract_address(), &from, &amount);
+    }
+
+    // ── Per-Achievement Reward Management ────────────────────────────────────
+
+    /// Admin: allocate `amount` as the reward for a specific achievement.
+    /// Overwrites any previous allocation for that achievement.
+    pub fn set_achievement_reward(env: Env, achievement_id: u32, amount: i128) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AchievementPool(achievement_id), &amount);
+    }
+
+    /// Claim the reward for `achievement_id` on behalf of `recipient`.
+    ///
+    /// Rules enforced:
+    /// - Admin-only call (the orchestrator, acting as admin, calls this
+    ///   after ZK proof verification).
+    /// - The achievement must have a reward configured.
+    /// - The player must not have already claimed this achievement reward.
+    /// - The pool must hold enough tokens.
+    pub fn claim_achievement_reward(
+        env: Env,
+        recipient: Address,
+        achievement_id: u32,
+        amount: i128,
+    ) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        assert!(amount > 0, "amount must be positive");
+
+        // Replay protection: has this player already claimed this achievement?
+        let claim_key = DataKey::AchievementClaim(recipient.clone(), achievement_id);
+        assert!(
+            !env.storage().persistent().has(&claim_key),
+            "achievement reward already claimed"
+        );
+
+        // Check the pool has enough.
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalDeposited)
+            .unwrap_or(0);
+        assert!(total >= amount, "insufficient pool balance");
+
+        // Transfer reward.
+        let token_id: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardToken)
+            .expect("not initialized");
+        let token = token::Client::new(&env, &token_id);
+        token.transfer(&env.current_contract_address(), &recipient, &amount);
+
+        // Deduct from pool total.
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalDeposited, &(total - amount));
+
+        // Mark as claimed.
+        env.storage().persistent().set(&claim_key, &true);
+
+        env.events().publish(
+            (symbol_short!("ach_clm"),),
+            (recipient, achievement_id, amount),
+        );
+    }
+
+    /// Return true if `player` has already claimed the reward for `achievement_id`.
+    pub fn is_achievement_claimed(env: Env, player: Address, achievement_id: u32) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::AchievementClaim(player, achievement_id))
+    }
+
+    /// Return the configured reward amount for `achievement_id` (0 if not set).
+    pub fn achievement_reward_amount(env: Env, achievement_id: u32) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AchievementPool(achievement_id))
+            .unwrap_or(0)
     }
 
     // ── Queries ──────────────────────────────────────────────────────────────
